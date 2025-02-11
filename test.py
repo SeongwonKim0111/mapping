@@ -1,4 +1,19 @@
-from math import radians
+#!/usr/bin/env python3
+import logging
+import time
+from math import radians, degrees
+
+import cflib.crtp
+from cflib.crazyflie import Crazyflie
+from cflib.crazyflie.log import LogConfig
+from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
+from cflib.crazyflie.syncLogger import SyncLogger
+from cflib.positioning.motion_commander import MotionCommander
+from cflib.utils import uri_helper
+from cflib.utils.multiranger import Multiranger
+
+# 환경 변수 URI (환경에 맞게 수정)
+URI = uri_helper.uri_from_env(default='radio://0/80/2M/E7E7E7E7E7')
 
 def is_close(range):
     MIN_DISTANCE = 0.2  # m
@@ -8,7 +23,7 @@ def is_close(range):
     else:
         return range < MIN_DISTANCE
 
-class MW_WallFollower:
+class SimpleWallFollower:
     """
     Manhattan world 가정하에서 두 가지 조건을 체크하여 상태를 전환하는 단순화된 벽 추종 로직.
     
@@ -22,7 +37,7 @@ class MW_WallFollower:
           - TURN 상태에서는 설정한 turn_duration 동안 회전 명령을 유지한 후 FORWARD 상태로 복귀.
           - 회전 방향은 turn_direction ("LEFT" 또는 "RIGHT")에 따라 달라짐.
     """
-    def __init__(self, desired_distance=0.25, forward_speed=0.15,
+    def __init__(self, desired_distance=0.25, forward_speed=0.2,
                  turn_rate=radians(90)/1.0, threshold_front=0.3,
                  gain=1.0, turn_duration=1.0, left_loss_margin=0.2):
         self.desired_distance = desired_distance  # 목표 벽과의 거리 (m)
@@ -86,3 +101,69 @@ class MW_WallFollower:
                 # TURN 상태에서는 선택한 회전 방향에 따라 회전 명령을 유지
                 if self.turn_direction == "LEFT":
                     return 0.0, 0.0, -self.turn_rate
+
+def main():
+    cflib.crtp.init_drivers()
+    logging.basicConfig(level=logging.ERROR)
+
+    wall_follower = SimpleWallFollower()
+
+    lg_stab = LogConfig(name='Stabilizer', period_in_ms=100)
+    lg_stab.add_variable('stabilizer.yaw', 'float')
+
+    cf = Crazyflie(rw_cache='./cache')
+    first_run = True
+    with SyncCrazyflie(URI, cf=cf) as scf:
+        scf.cf.platform.send_arming_request(True)
+        time.sleep(1.0)
+
+        with MotionCommander(scf) as motion_commander:
+            with Multiranger(scf) as multiranger:
+                with SyncLogger(scf, lg_stab) as logger:
+                    print("Simplified Manhattan-world wall following started")
+                    try:
+                        while True:
+                            #Check LiDAR measurment get successfully
+                            if first_run:
+                                if multiranger.left is None:
+                                    continue
+                                else:
+                                    first_run = False
+
+                            # 센서 데이터 (미터 단위)
+                            if multiranger.front is None:
+                                front_range = 999
+                            else:
+                                front_range = multiranger.front  # 전방 센서
+
+                            if multiranger.left is None:
+                                left_range = 999
+                            else:
+                                left_range = multiranger.left   # 좌측 센서
+
+                            t = time.time()
+                            # 상태 업데이트: 전진 명령 또는 회전 명령 결정
+                            v_x, v_y, yaw_rate = wall_follower.update(front_range, left_range, t)
+                        
+                            # MotionCommander는 yaw_rate를 deg/s 단위로 받으므로 변환
+                            # (부호는 라이브러리 이슈에 따라 조정)
+                            yaw_rate_deg = degrees(yaw_rate)
+                            
+                            motion_commander.start_linear_motion(v_x, v_y, 0, rate_yaw=yaw_rate_deg)
+                        
+                            # 디버깅 출력
+                            print(f"State: {wall_follower.state:7s} | front: {front_range:.2f} | left: {left_range:.2f} | v_x: {v_x:.2f} | v_y: {v_y:.2f} | yaw_rate: {yaw_rate_deg:.2f}")
+                        
+                            # 상단 센서(up)가 0.2m 미만이면 종료 (예: 착륙)
+                            if is_close(multiranger.up):
+                                print("Top sensor triggered. Stopping wall following.")
+                                motion_commander.land(0.1)
+                                break
+                            
+                            time.sleep(0.1)
+                    except KeyboardInterrupt:
+                        print("KeyboardInterrupt received. Exiting loop.")
+            scf.cf.platform.send_arming_request(False)
+
+if __name__ == '__main__':
+    main()

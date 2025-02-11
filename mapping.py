@@ -11,13 +11,20 @@ from vispy.scene.cameras import PanZoomCamera
 import cflib.crtp
 from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.log import LogConfig
+from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
+from cflib.crazyflie.syncLogger import SyncLogger
+from cflib.positioning.motion_commander import MotionCommander
 from cflib.utils import uri_helper
+from cflib.utils.multiranger import Multiranger
 
-from wall_following import ManhattanWallFollower
+from MW_wall_following import MW_WallFollower, is_close
 
 from PyQt6 import QtWidgets, QtCore
 import imageio
 
+from multiprocessing import Process
+
+logging.basicConfig(level=logging.ERROR)
 logging.basicConfig(level=logging.INFO)
 
 # Crazyflie 연결 설정
@@ -48,7 +55,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.setCentralWidget(self.canvas.native)
 
-        cflib.crtp.init_drivers()
         self.cf = Crazyflie(ro_cache=None, rw_cache='cache')
 
         # Connect callbacks from the Crazyflie API
@@ -57,10 +63,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Connect to the Crazyflie
         self.cf.open_link(URI)
-
-        # Arm the Crazyflie
-        self.cf.platform.send_arming_request(True)
-        time.sleep(1.0)
 
         self.hover = {'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0, 'height': 0.3}
 
@@ -145,10 +147,6 @@ class MainWindow(QtWidgets.QMainWindow):
         }
         self.canvas.set_measurement(measurement)
 
-    def closeEvent(self, event):
-        if (self.cf is not None):
-            self.cf.close_link()
-
 
 class Canvas(scene.SceneCanvas):
     def __init__(self, keyupdateCB):
@@ -197,47 +195,6 @@ class Canvas(scene.SceneCanvas):
         self.set_position(self.last_pos)
         
         self.freeze()
-
-    def on_key_press(self, event):
-        if not event.native.isAutoRepeat():
-            if event.native.key() == QtCore.Qt.Key.Key_Left:
-                self.keyCB('y', 0.5)
-            if event.native.key() == QtCore.Qt.Key.Key_Right:
-                self.keyCB('y', -0.5)
-            if event.native.key() == QtCore.Qt.Key.Key_Up:
-                self.keyCB('x', 0.5)
-            if event.native.key() == QtCore.Qt.Key.Key_Down:
-                self.keyCB('x', -0.5)
-            if event.native.key() == QtCore.Qt.Key.Key_A:
-                self.keyCB('yaw', -70)
-            if event.native.key() == QtCore.Qt.Key.Key_D:
-                self.keyCB('yaw', 70)
-            if event.native.key() == QtCore.Qt.Key.Key_Z:
-                self.keyCB('yaw', -200)
-            if event.native.key() == QtCore.Qt.Key.Key_X:
-                self.keyCB('yaw', 200)
-            if event.native.key() == QtCore.Qt.Key.Key_W:
-                self.keyCB('height', 0.1)
-            if event.native.key() == QtCore.Qt.Key.Key_S:
-                self.keyCB('height', -0.1)
-            if event.native.key() == QtCore.Qt.Key.Key_P:
-                self.stop_and_save()
-
-    def on_key_release(self, event):
-        if not event.native.isAutoRepeat():
-            if event.native.key() == QtCore.Qt.Key.Key_Left:
-                self.keyCB('y', 0)
-            if event.native.key() == QtCore.Qt.Key.Key_Right:
-                self.keyCB('y', 0)
-            if event.native.key() == QtCore.Qt.Key.Key_Up:
-                self.keyCB('x', 0)
-            if event.native.key() == QtCore.Qt.Key.Key_Down:
-                self.keyCB('x', 0)
-            if event.native.key() in (QtCore.Qt.Key.Key_A, QtCore.Qt.Key.Key_D, 
-                                        QtCore.Qt.Key.Key_Z, QtCore.Qt.Key.Key_X):
-                self.keyCB('yaw', 0)
-            if event.native.key() in (QtCore.Qt.Key.Key_W, QtCore.Qt.Key.Key_S):
-                self.keyCB('height', 0)
 
     def set_position(self, pos):
         # In 2D, use only the x and y coordinates.
@@ -312,8 +269,80 @@ class Canvas(scene.SceneCanvas):
 
 
 
-if __name__ == "__main__":
+def Show_window():
     app = QtWidgets.QApplication(sys.argv)
     window = MainWindow(URI)
     window.show()
     app.exec()
+
+def wall_following():
+    wall_follower = MW_WallFollower()
+
+    lg_stab = LogConfig(name='Stabilizer', period_in_ms=100)
+    lg_stab.add_variable('stabilizer.yaw', 'float')
+
+    cf = Crazyflie(rw_cache='./cache')
+    first_run = True
+    with SyncCrazyflie(URI, cf=cf) as scf:
+        scf.cf.platform.send_arming_request(True)
+        time.sleep(1.0)
+
+        with MotionCommander(scf) as motion_commander:
+            with Multiranger(scf) as multiranger:
+                with SyncLogger(scf, lg_stab) as logger:
+                    print("Simplified Manhattan-world wall following started")
+                    try:
+                        while True:
+                            #Check LiDAR measurment get successfully
+                            if first_run:
+                                if multiranger.left is None:
+                                    continue
+                                else:
+                                    first_run = False
+
+                            # 센서 데이터 (미터 단위)
+                            if multiranger.front is None:
+                                front_range = 999
+                            else:
+                                front_range = multiranger.front  # 전방 센서
+
+                            if multiranger.left is None:
+                                left_range = 999
+                            else:
+                                left_range = multiranger.left   # 좌측 센서
+
+                            t = time.time()
+                            # 상태 업데이트: 전진 명령 또는 회전 명령 결정
+                            v_x, v_y, yaw_rate = wall_follower.update(front_range, left_range, t)
+                        
+                            # MotionCommander는 yaw_rate를 deg/s 단위로 받으므로 변환
+                            # (부호는 라이브러리 이슈에 따라 조정)
+                            yaw_rate_deg = math.degrees(yaw_rate)
+                            
+                            motion_commander.start_linear_motion(v_x, v_y, 0, rate_yaw=yaw_rate_deg)
+                        
+                            # 디버깅 출력
+                            print(f"State: {wall_follower.state:7s} | front: {front_range:.2f} | left: {left_range:.2f} | v_x: {v_x:.2f} | v_y: {v_y:.2f} | yaw_rate: {yaw_rate_deg:.2f}")
+                        
+                            # 상단 센서(up)가 0.2m 미만이면 종료 (예: 착륙)
+                            if is_close(multiranger.up):
+                                print("Top sensor triggered. Stopping wall following.")
+                                motion_commander.land(0.2)
+                                break
+                            
+                            time.sleep(0.1)
+                    except KeyboardInterrupt:
+                        print("KeyboardInterrupt received. Exiting loop.")
+            scf.cf.platform.send_arming_request(False)
+
+if __name__ == '__main__':
+    cflib.crtp.init_drivers()
+
+    #window_process = Process(target=Show_window)
+    follow_process = Process(target=wall_following)
+
+    #window_process.start()
+    follow_process.start()
+
+    follow_process.join()
+    #window_process.join()
