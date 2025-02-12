@@ -1,7 +1,14 @@
-#!/usr/bin/env python3
 import logging
+import math
+import sys
 import time
-from math import radians, degrees
+import threading
+import numpy as np
+import csv  # CSV 파일 기록을 위한 모듈
+
+from vispy import scene
+from vispy.scene import visuals
+from vispy.scene.cameras import PanZoomCamera
 
 import cflib.crtp
 from cflib.crazyflie import Crazyflie
@@ -12,158 +19,306 @@ from cflib.positioning.motion_commander import MotionCommander
 from cflib.utils import uri_helper
 from cflib.utils.multiranger import Multiranger
 
-# 환경 변수 URI (환경에 맞게 수정)
-URI = uri_helper.uri_from_env(default='radio://0/80/2M/E7E7E7E7E7')
+# 사용자가 작성한 벽 추종 알고리즘 (예: 간단한 Manhattan-world wall following)
+from MW_wall_following import MW_WallFollower, is_close
 
-def is_close(range):
-    MIN_DISTANCE = 0.2  # m
+from PyQt6 import QtWidgets, QtCore
+import imageio
 
-    if range is None:
-        return False
-    else:
-        return range < MIN_DISTANCE
+# 로깅 설정
+logging.basicConfig(level=logging.INFO)
 
-class SimpleWallFollower:
-    """
-    Manhattan world 가정하에서 두 가지 조건을 체크하여 상태를 전환하는 단순화된 벽 추종 로직.
-    
-    기본 동작:
-      - FORWARD 상태:
-          - 전방 센서(front_range)가 임계값(threshold_front) 이하이면, 장애물이 있으므로 RIGHT 회전 수행.
-          - 좌측 센서(left_range)가 목표 거리(desired_distance)보다 너무 크면(예: desired_distance + left_loss_margin 초과)
-            왼쪽 벽이 꺾였다고 판단하여 LEFT 회전 수행.
-          - 그 외에는 왼쪽 센서 오차(error)를 기반으로 간단한 보정(lateral_speed)을 적용하며 전진.
-      - TURN 상태:
-          - TURN 상태에서는 설정한 turn_duration 동안 회전 명령을 유지한 후 FORWARD 상태로 복귀.
-          - 회전 방향은 turn_direction ("LEFT" 또는 "RIGHT")에 따라 달라짐.
-    """
-    def __init__(self, desired_distance=0.25, forward_speed=0.2,
-                 turn_rate=radians(90)/1.0, threshold_front=0.3,
-                 gain=1.0, turn_duration=1.0, left_loss_margin=0.2):
-        self.desired_distance = desired_distance  # 목표 벽과의 거리 (m)
-        self.forward_speed = forward_speed        # 전진 속도 (m/s)
-        self.turn_rate = turn_rate                # 회전 속도 (rad/s); turn_duration 동안 약 90° 회전
-        self.threshold_front = threshold_front    # 전방 센서 임계값 (m)
-        self.gain = gain                          # lateral 보정에 대한 비례 게인
-        self.turn_duration = turn_duration        # 회전 지속 시간 (초)
-        self.left_loss_margin = left_loss_margin  # 좌측 센서 값이 desired_distance보다 이 값만큼 크면 벽이 꺾인 것으로 판단
+# Crazyflie 연결 URI 및 기타 상수
+URI = uri_helper.uri_from_env(default="radio://0/80/2M/E7E7E7E7E7")
+SENSOR_TH = 2000  # mm 단위 센서 임계값
+SPEED_FACTOR = 0.2
 
-        self.state = "FORWARD"    # 초기 상태
-        self.turn_direction = None  # "LEFT" 또는 "RIGHT"
-        self.turn_start_time = 0.0
-        self.left_turn_flag = True
+# 전역으로 공유할 데이터 (로그 콜백에서 업데이트하고, 캔버스 및 CSV 로거에서 읽음)
+global_data = {
+    'position': [0.0, 0.0, 0.0],
+    'measurement': None,  # {'roll':..., 'pitch':..., 'yaw':..., 'front':..., 'back':..., 'up':..., 'left':..., 'right':..., 'down':...}
+}
+# 전역 데이터 접근 동기화를 위한 락
+data_lock = threading.Lock()
 
-    def update(self, front_range, left_range, current_time):
-        if self.state == "FORWARD":
-            if not self.left_turn_flag:
-                if left_range < self.desired_distance + self.left_loss_margin:
-                    self.left_turn_flag = True
-            # 전방 장애물이 감지되면 RIGHT 회전으로 전환
-            if front_range < self.threshold_front:
-                self.state = "TURN_RIGHT"
-                self.turn_direction = "RIGHT"
-                self.turn_start_time = current_time
-                return 0.0, 0.0, self.turn_rate  # 오른쪽 회전
-            # 좌측 센서 값이 목표치보다 크게 측정되면(즉, 벽이 꺾여서 사라짐) LEFT 회전으로 전환
-            elif left_range > self.desired_distance + self.left_loss_margin:
-                if self.left_turn_flag:
-                    self.state = "TURN_LEFT"
-                    self.turn_direction = "LEFT"
-                    self.turn_start_time = current_time
-                    self.left_turn_flag = False
-                    return 0.0, 0.0, -self.turn_rate
+########################################################################
+# CSV 로거 쓰레드: 일정 주기로 global_data에 기록된 로그 데이터를 CSV 파일에 저장
+########################################################################
+class CSVLogger(threading.Thread):
+    def __init__(self, filename, interval=0.1):
+        super().__init__()
+        self.filename = filename
+        self.interval = interval
+        self._stop_event = threading.Event()
+        # CSV 파일 열기 및 헤더 기록
+        self.file = open(self.filename, 'w', newline='')
+        self.writer = csv.writer(self.file)
+        self.writer.writerow([
+            'timestamp', 
+            'x', 'y', 'z', 
+            'roll', 'pitch', 'yaw', 
+            'front', 'back', 'up', 'left', 'right', 'down'
+        ])
+
+    def run(self):
+        while not self._stop_event.is_set():
+            ts = time.time()
+            with data_lock:
+                position = global_data.get('position', [None, None, None])
+                measurement = global_data.get('measurement', {
+                    'roll': None,
+                    'pitch': None,
+                    'yaw': None,
+                    'front': None,
+                    'back': None,
+                    'up': None,
+                    'left': None,
+                    'right': None,
+                    'down': None
+                })
+            # 한 줄에 timestamp, 위치, 센서 데이터를 기록
+            self.writer.writerow([
+                ts,
+                position[0], position[1], position[2],
+                measurement.get('roll'),
+                measurement.get('pitch'),
+                measurement.get('yaw'),
+                measurement.get('front'),
+                measurement.get('back'),
+                measurement.get('up'),
+                measurement.get('left'),
+                measurement.get('right'),
+                measurement.get('down')
+            ])
+            self.file.flush()
+            time.sleep(self.interval)
+
+    def stop(self):
+        self._stop_event.set()
+        self.join()
+        self.file.close()
+
+########################################################################
+# 2D 맵 시각화를 위한 Canvas (PyQt + Vispy)
+########################################################################
+class Canvas(scene.SceneCanvas):
+    def __init__(self):
+        scene.SceneCanvas.__init__(self, keys=None, size=(800, 600))
+        self.unfreeze()
+        self.view = self.central_widget.add_view()
+        self.view.bgcolor = '#ffffff'
+        # 카메라 설정 (2D PanZoom)
+        self.view.camera = PanZoomCamera(rect=(-5, -5, 10, 10))
+        self.view.camera.set_range()
+
+        # 마지막 위치 (2D: x,y)
+        self.last_pos = [0.0, 0.0]
+
+        # 드론 경로 및 센서측정 포인트를 저장할 배열
+        self.pos_history = np.empty((0, 2))
+        self.meas_history = np.empty((0, 2))
+
+        # 시각화를 위한 마커와 센서선을 생성
+        self.pos_markers = visuals.Markers()
+        self.meas_markers = visuals.Markers()
+        self.lines = []
+        for _ in range(4):  # left, right, front, back
+            line = visuals.Line(color='black')
+            self.lines.append(line)
+            self.view.add(line)
+        self.view.add(self.pos_markers)
+        self.view.add(self.meas_markers)
+
+        # 100ms마다 화면 갱신하는 타이머
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.update_canvas)
+        self.timer.start(100)
+
+        self.freeze()
+
+    def update_canvas(self):
+        # 전역 변수 global_data에서 최신 position과 measurement를 가져옴
+        with data_lock:
+            pos = global_data.get('position')
+            meas = global_data.get('measurement')
+        if pos is not None:
+            # 2D 위치 (x, y) 업데이트
+            self.last_pos = [pos[0], pos[1]]
+            self.pos_history = np.append(self.pos_history, [[pos[0], pos[1]]], axis=0)
+            self.pos_markers.set_data(self.pos_history, face_color='red', size=5)
+        if meas is not None:
+            points = self.rotate_and_create_points(meas)
+            # 센서 측정 선을 현재 위치에서 각 센서측정점으로 연결
+            for i in range(4):
+                if i < len(points):
+                    self.lines[i].set_data(np.array([self.last_pos, points[i]]))
                 else:
-                    return self.forward_speed, 0.0, 0.0
-            else:
-                # 정상 전진: 좌측 오차(error)를 기반으로 lateral 보정
-                error = self.desired_distance - left_range
-                lateral_speed = -self.gain * error
-                return self.forward_speed, lateral_speed, 0.0
+                    self.lines[i].set_data(np.array([self.last_pos, self.last_pos]))
+            if points:
+                self.meas_history = np.append(self.meas_history, np.array(points), axis=0)
+                self.meas_markers.set_data(self.meas_history, face_color='blue', size=5)
+        self.update()
 
-        elif self.state == "TURN_RIGHT":
-            if current_time - self.turn_start_time >= self.turn_duration:
-                # 회전 시간이 지나면 FORWARD 상태로 복귀
-                self.state = "FORWARD"
-                self.turn_direction = None
-                return self.forward_speed, 0.0, 0.0
-            else:
-                # TURN 상태에서는 선택한 회전 방향에 따라 회전 명령을 유지
-                if self.turn_direction == "RIGHT":
-                    return 0.0, 0.0, self.turn_rate
-                
-        elif self.state == "TURN_LEFT":
-            if current_time - self.turn_start_time >= self.turn_duration:
-                # 회전 시간이 지나면 FORWARD 상태로 복귀
-                self.state = "FORWARD"
-                self.turn_direction = None
-                return self.forward_speed, 0.0, 0.0
-            else:
-                # TURN 상태에서는 선택한 회전 방향에 따라 회전 명령을 유지
-                if self.turn_direction == "LEFT":
-                    return 0.0, 0.0, -self.turn_rate
+    def rot2d(self, yaw, origin, point):
+        """yaw 각도(도)를 사용하여 origin을 기준으로 point를 회전"""
+        rad = math.radians(yaw)
+        cos_ = math.cos(rad)
+        sin_ = math.sin(rad)
+        dx = point[0] - origin[0]
+        dy = point[1] - origin[1]
+        x_new = origin[0] + (dx * cos_ - dy * sin_)
+        y_new = origin[1] + (dx * sin_ + dy * cos_)
+        return [x_new, y_new]
 
-def main():
-    cflib.crtp.init_drivers()
-    logging.basicConfig(level=logging.ERROR)
+    def rotate_and_create_points(self, m):
+        """left, right, front, back 센서 데이터를 2D 좌표로 변환"""
+        data = []
+        o = self.last_pos
+        yaw = m['yaw']
 
-    wall_follower = SimpleWallFollower()
+        if m['left'] < SENSOR_TH:
+            left = [o[0], o[1] + m['left'] / 1000.0]
+            data.append(self.rot2d(yaw, o, left))
+        if m['right'] < SENSOR_TH:
+            right = [o[0], o[1] - m['right'] / 1000.0]
+            data.append(self.rot2d(yaw, o, right))
+        if m['front'] < SENSOR_TH:
+            front = [o[0] + m['front'] / 1000.0, o[1]]
+            data.append(self.rot2d(yaw, o, front))
+        if m['back'] < SENSOR_TH:
+            back = [o[0] - m['back'] / 1000.0, o[1]]
+            data.append(self.rot2d(yaw, o, back))
+        return data
 
+    def stop_and_save(self):
+        """맵을 이미지 파일(map.png)로 저장하고 캔버스를 닫음"""
+        img = self.render()
+        imageio.imsave('map.png', img)
+        print("Map saved to 'map.png'. Stopping mapping.")
+        self.close()
+
+########################################################################
+# 로그 콜백 함수 (로그 설정에서 호출)
+########################################################################
+def update_position_callback(timestamp, data, logconf):
+    # position 데이터 (stateEstimate.x, y, z) 업데이트
+    with data_lock:
+        global_data['position'] = [data['stateEstimate.x'], data['stateEstimate.y'], data['stateEstimate.z']]
+
+def update_measurement_callback(timestamp, data, logconf):
+    # 센서 데이터(roll, pitch, yaw, multiranger의 front, back, up, left, right, zrange)를 업데이트
+    with data_lock:
+        global_data['measurement'] = {
+            'roll': data['stabilizer.roll'],
+            'pitch': data['stabilizer.pitch'],
+            'yaw': data['stabilizer.yaw'],
+            'front': data['range.front'],
+            'back': data['range.back'],
+            'up': data['range.up'],
+            'left': data['range.left'],
+            'right': data['range.right'],
+            'down': data.get('range.zrange', 999)  # 값이 없으면 999로 처리
+        }
+
+########################################################################
+# 벽 추종(wall following) 동작을 수행하는 함수 (Movement 제어 포함)
+########################################################################
+def wall_following_loop(scf):
+    wall_follower = MW_WallFollower()
     lg_stab = LogConfig(name='Stabilizer', period_in_ms=100)
     lg_stab.add_variable('stabilizer.yaw', 'float')
 
-    cf = Crazyflie(rw_cache='./cache')
-    first_run = True
-    with SyncCrazyflie(URI, cf=cf) as scf:
-        scf.cf.platform.send_arming_request(True)
-        time.sleep(1.0)
+    # 드론 모터 활성화
+    scf.cf.platform.send_arming_request(True)
+    time.sleep(1.0)
 
+    try:
         with MotionCommander(scf) as motion_commander:
             with Multiranger(scf) as multiranger:
                 with SyncLogger(scf, lg_stab) as logger:
-                    print("Simplified Manhattan-world wall following started")
-                    try:
-                        while True:
-                            #Check LiDAR measurment get successfully
-                            if first_run:
-                                if multiranger.left is None:
-                                    continue
-                                else:
-                                    first_run = False
-
-                            # 센서 데이터 (미터 단위)
-                            if multiranger.front is None:
-                                front_range = 999
-                            else:
-                                front_range = multiranger.front  # 전방 센서
-
+                    print("Wall following started")
+                    first_run = True
+                    while True:
+                        # 초기 실행 시 left 센서 값이 없으면 대기
+                        if first_run:
                             if multiranger.left is None:
-                                left_range = 999
+                                continue
                             else:
-                                left_range = multiranger.left   # 좌측 센서
+                                first_run = False
 
-                            t = time.time()
-                            # 상태 업데이트: 전진 명령 또는 회전 명령 결정
-                            v_x, v_y, yaw_rate = wall_follower.update(front_range, left_range, t)
-                        
-                            # MotionCommander는 yaw_rate를 deg/s 단위로 받으므로 변환
-                            # (부호는 라이브러리 이슈에 따라 조정)
-                            yaw_rate_deg = degrees(yaw_rate)
-                            
-                            motion_commander.start_linear_motion(v_x, v_y, 0, rate_yaw=yaw_rate_deg)
-                        
-                            # 디버깅 출력
-                            print(f"State: {wall_follower.state:7s} | front: {front_range:.2f} | left: {left_range:.2f} | v_x: {v_x:.2f} | v_y: {v_y:.2f} | yaw_rate: {yaw_rate_deg:.2f}")
-                        
-                            # 상단 센서(up)가 0.2m 미만이면 종료 (예: 착륙)
-                            if is_close(multiranger.up):
-                                print("Top sensor triggered. Stopping wall following.")
-                                motion_commander.land(0.1)
-                                break
-                            
-                            time.sleep(0.1)
-                    except KeyboardInterrupt:
-                        print("KeyboardInterrupt received. Exiting loop.")
-            scf.cf.platform.send_arming_request(False)
+                        # 센서 측정 (단위: 미터)
+                        front_range = multiranger.front if multiranger.front is not None else 999
+                        left_range = multiranger.left if multiranger.left is not None else 999
+
+                        t = time.time()
+                        v_x, v_y, yaw_rate = wall_follower.update(front_range, left_range, t)
+                        yaw_rate_deg = math.degrees(yaw_rate)
+                        motion_commander.start_linear_motion(v_x, v_y, 0, rate_yaw=yaw_rate_deg)
+
+                        print(f"State: {wall_follower.state:7s} | front: {front_range:.2f} | left: {left_range:.2f} | "
+                              f"v_x: {v_x:.2f} | v_y: {v_y:.2f} | yaw_rate: {yaw_rate_deg:.2f}")
+
+                        # 위쪽 센서(up)가 일정 거리 이하이면 착륙 후 종료
+                        if is_close(multiranger.up):
+                            print("Top sensor triggered. Landing.")
+                            motion_commander.land(0.2)
+                            break
+
+                        time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("KeyboardInterrupt received. Exiting wall following loop.")
+    finally:
+        scf.cf.platform.send_arming_request(False)
+
+########################################################################
+# 메인 함수: 연결, 로그 설정, wall following, 그리고 시각화 실행
+########################################################################
+def main():
+    cflib.crtp.init_drivers()
+    cf = Crazyflie(rw_cache='./cache')
+    with SyncCrazyflie(URI, cf=cf) as scf:
+        # [1] CSV 로거 시작 (별도 쓰레드)
+        csv_logger = CSVLogger('log.csv', interval=0.1)
+        csv_logger.start()
+
+        # [2] 로그 설정: position
+        lpos = LogConfig(name='Position', period_in_ms=100)
+        lpos.add_variable('stateEstimate.x')
+        lpos.add_variable('stateEstimate.y')
+        lpos.add_variable('stateEstimate.z')
+        scf.cf.log.add_config(lpos)
+        lpos.data_received_cb.add_callback(update_position_callback)
+        lpos.start()
+
+        # [3] 로그 설정: 측정값 (multiranger 및 stabilizer)
+        lmeas = LogConfig(name='Meas', period_in_ms=100)
+        lmeas.add_variable('range.front')
+        lmeas.add_variable('range.back')
+        lmeas.add_variable('range.up')
+        lmeas.add_variable('range.left')
+        lmeas.add_variable('range.right')
+        lmeas.add_variable('range.zrange')
+        lmeas.add_variable('stabilizer.roll')
+        lmeas.add_variable('stabilizer.pitch')
+        lmeas.add_variable('stabilizer.yaw')
+        scf.cf.log.add_config(lmeas)
+        lmeas.data_received_cb.add_callback(update_measurement_callback)
+        lmeas.start()
+
+        # [4] 벽 추종 동작을 별도 쓰레드에서 실행
+        wall_thread = threading.Thread(target=wall_following_loop, args=(scf,))
+        wall_thread.start()
+
+        # [5] Qt/Vispy를 이용해 2D 맵 실시간 시각화 (이 부분에서는 드론 제어 코드는 없음)
+        app = QtWidgets.QApplication(sys.argv)
+        canvas = Canvas()
+        canvas.show()
+        app.exec()
+
+        # Qt 창 종료 후 CSV 로거 중지, 벽 추종 쓰레드 종료 대기 및 맵 저장
+        csv_logger.stop()
+        wall_thread.join()
+        canvas.stop_and_save()
 
 if __name__ == '__main__':
     main()

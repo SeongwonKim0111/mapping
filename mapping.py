@@ -24,6 +24,10 @@ from MW_wall_following import MW_WallFollower, is_close
 from PyQt6 import QtWidgets, QtCore
 import imageio
 
+import datetime
+suffix = datetime.datetime.now().strftime('%y%m%d_%H%M%S')
+fileName = suffix + '.jpg'
+
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
 
@@ -34,6 +38,7 @@ SPEED_FACTOR = 0.2
 
 # 전역으로 공유할 데이터 (로그 콜백에서 업데이트하고, 캔버스에서 읽음)
 global_data = {
+    'timestamp' : None,
     'position': [0.0, 0.0, 0.0],
     'measurement': None,  # {'roll':..., 'pitch':..., 'yaw':..., 'front':..., 'back':..., 'up':..., 'left':..., 'right':..., 'down':...}
 }
@@ -74,29 +79,47 @@ class Canvas(scene.SceneCanvas):
         self.timer.timeout.connect(self.update_canvas)
         self.timer.start(100)
 
+        self.file_path = './log/' + suffix + '_log.txt'
+
         self.freeze()
 
     def update_canvas(self):
-        # 전역 변수 global_data에서 최신 position과 measurement를 가져옴
-        pos = global_data.get('position')
-        meas = global_data.get('measurement')
-        if pos is not None:
-            # 2D 위치 (x, y) 업데이트
-            self.last_pos = [pos[0], pos[1]]
-            self.pos_history = np.append(self.pos_history, [[pos[0], pos[1]]], axis=0)
-            self.pos_markers.set_data(self.pos_history, face_color='red', size=5)
-        if meas is not None:
-            points = self.rotate_and_create_points(meas)
-            # 센서 측정 선을 현재 위치에서 각 센서측정점으로 연결
-            for i in range(4):
-                if i < len(points):
-                    self.lines[i].set_data(np.array([self.last_pos, points[i]]))
-                else:
-                    self.lines[i].set_data(np.array([self.last_pos, self.last_pos]))
-            if points:
-                self.meas_history = np.append(self.meas_history, np.array(points), axis=0)
-                self.meas_markers.set_data(self.meas_history, face_color='blue', size=5)
-        self.update()
+        with open(self.file_path, "a") as f:
+            # 전역 변수 global_data에서 최신 position과 measurement를 가져옴
+            t_step = global_data.get('timestamp')
+            pos = global_data.get('position')
+            meas = global_data.get('measurement')
+            if t_step is not None:
+                f.write("Timestamp: " + str(t_step) + " | ")
+            if pos is not None:
+                f.write("X_pos: " + str(pos[0]) + " | " + "Y_pos: " + str(pos[1]) + " | ")
+                # 2D 위치 (x, y) 업데이트
+                self.last_pos = [pos[0], pos[1]]
+                self.pos_history = np.append(self.pos_history, [[pos[0], pos[1]]], axis=0)
+                self.pos_markers.set_data(self.pos_history, face_color='red', size=5)
+            if meas is not None:
+                for key in meas:
+                    if key in ['roll', 'pitch', 'up']:
+                        pass
+                    elif key in ['front', 'back', 'left', 'right', 'down']:
+                        if meas[key] > 4000:
+                            f.write(str(key) + ": None | ")
+                        else:
+                            f.write(str(key) + ": " + str(meas[key] / 1000) + " | ")
+                    else:
+                        f.write(str(key) + ": " + str(meas[key]) + " | ")
+                points = self.rotate_and_create_points(meas)
+                # 센서 측정 선을 현재 위치에서 각 센서측정점으로 연결
+                for i in range(4):
+                    if i < len(points):
+                        self.lines[i].set_data(np.array([self.last_pos, points[i]]))
+                    else:
+                        self.lines[i].set_data(np.array([self.last_pos, self.last_pos]))
+                if points:
+                    self.meas_history = np.append(self.meas_history, np.array(points), axis=0)
+                    self.meas_markers.set_data(self.meas_history, face_color='blue', size=5)
+            f.write('\n')
+            self.update()
 
     def rot2d(self, yaw, origin, point):
         """yaw 각도(도)를 사용하여 origin을 기준으로 point를 회전"""
@@ -132,8 +155,8 @@ class Canvas(scene.SceneCanvas):
     def stop_and_save(self):
         """맵을 이미지 파일(map.png)로 저장하고 캔버스를 닫음"""
         img = self.render()
-        imageio.imsave('map.png', img)
-        print("Map saved to 'map.png'. Stopping mapping.")
+        imageio.imsave('./map/' + suffix + '_map.png', img)
+        print("Map saved. Stopping mapping.")
         self.close()
 
 ########################################################################
@@ -141,6 +164,7 @@ class Canvas(scene.SceneCanvas):
 ########################################################################
 def update_position_callback(timestamp, data, logconf):
     # position 데이터 (stateEstimate.x, y, z) 업데이트
+    global_data['timestamp'] = timestamp
     global_data['position'] = [data['stateEstimate.x'], data['stateEstimate.y'], data['stateEstimate.z']]
 
 def update_measurement_callback(timestamp, data, logconf):
