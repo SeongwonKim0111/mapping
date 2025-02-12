@@ -2,8 +2,9 @@ import logging
 import math
 import sys
 import time
-
+import threading
 import numpy as np
+
 from vispy import scene
 from vispy.scene import visuals
 from vispy.scene.cameras import PanZoomCamera
@@ -17,197 +18,88 @@ from cflib.positioning.motion_commander import MotionCommander
 from cflib.utils import uri_helper
 from cflib.utils.multiranger import Multiranger
 
+# 사용자가 작성한 벽 추종 알고리즘 (예: 간단한 Manhattan-world wall following)
 from MW_wall_following import MW_WallFollower, is_close
 
 from PyQt6 import QtWidgets, QtCore
 import imageio
 
-from multiprocessing import Process
-
-logging.basicConfig(level=logging.ERROR)
+# 로깅 설정
 logging.basicConfig(level=logging.INFO)
 
-# Crazyflie 연결 설정
+# Crazyflie 연결 URI 및 기타 상수
 URI = uri_helper.uri_from_env(default="radio://0/80/2M/E7E7E7E7E7")
-if len(sys.argv) > 1:
-    URI = sys.argv[1]
-
-# Enable plotting of Crazyflie
-PLOT_CF = False
-# Enable plotting of down sensor
-PLOT_SENSOR_DOWN = False
-# Set the sensor threshold (in mm)
-SENSOR_TH = 2000
-# Set the speed factor for moving and rotating
+SENSOR_TH = 2000  # mm 단위 센서 임계값
 SPEED_FACTOR = 0.2
 
-class MainWindow(QtWidgets.QMainWindow):
+# 전역으로 공유할 데이터 (로그 콜백에서 업데이트하고, 캔버스에서 읽음)
+global_data = {
+    'position': [0.0, 0.0, 0.0],
+    'measurement': None,  # {'roll':..., 'pitch':..., 'yaw':..., 'front':..., 'back':..., 'up':..., 'left':..., 'right':..., 'down':...}
+}
 
-    def __init__(self, URI):
-        QtWidgets.QMainWindow.__init__(self)
-
-        self.resize(700, 500)
-        self.setWindowTitle('Multi-ranger point cloud')
-
-        self.canvas = Canvas(self.updateHover)
-        self.canvas.create_native()
-        self.canvas.native.setParent(self)
-
-        self.setCentralWidget(self.canvas.native)
-
-        self.cf = Crazyflie(ro_cache=None, rw_cache='cache')
-
-        # Connect callbacks from the Crazyflie API
-        self.cf.connected.add_callback(self.connected)
-        self.cf.disconnected.add_callback(self.disconnected)
-
-        # Connect to the Crazyflie
-        self.cf.open_link(URI)
-
-        self.hover = {'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0, 'height': 0.3}
-
-        self.hoverTimer = QtCore.QTimer()
-        self.hoverTimer.timeout.connect(self.sendHoverCommand)
-        self.hoverTimer.setInterval(100)
-        self.hoverTimer.start()
-
-    def sendHoverCommand(self):
-        self.cf.commander.send_hover_setpoint(
-            self.hover['x'], self.hover['y'], self.hover['yaw'],
-            self.hover['height'])
-
-    def updateHover(self, k, v):
-        if (k != 'height'):
-            self.hover[k] = v * SPEED_FACTOR
-        else:
-            self.hover[k] += v
-
-    def disconnected(self, URI):
-        print('Disconnected')
-
-    def connected(self, URI):
-        print('We are now connected to {}'.format(URI))
-
-        # The definition of the logconfig can be made before connecting
-        lpos = LogConfig(name='Position', period_in_ms=100)
-        lpos.add_variable('stateEstimate.x')
-        lpos.add_variable('stateEstimate.y')
-        lpos.add_variable('stateEstimate.z')
-
-        try:
-            self.cf.log.add_config(lpos)
-            lpos.data_received_cb.add_callback(self.pos_data)
-            lpos.start()
-        except KeyError as e:
-            print('Could not start log configuration,'
-                  '{} not found in TOC'.format(str(e)))
-        except AttributeError:
-            print('Could not add Position log config, bad configuration.')
-
-        lmeas = LogConfig(name='Meas', period_in_ms=100)
-        lmeas.add_variable('range.front')
-        lmeas.add_variable('range.back')
-        lmeas.add_variable('range.up')
-        lmeas.add_variable('range.left')
-        lmeas.add_variable('range.right')
-        lmeas.add_variable('range.zrange')
-        lmeas.add_variable('stabilizer.roll')
-        lmeas.add_variable('stabilizer.pitch')
-        lmeas.add_variable('stabilizer.yaw')
-
-        try:
-            self.cf.log.add_config(lmeas)
-            lmeas.data_received_cb.add_callback(self.meas_data)
-            lmeas.start()
-        except KeyError as e:
-            print('Could not start log configuration,'
-                  '{} not found in TOC'.format(str(e)))
-        except AttributeError:
-            print('Could not add Measurement log config, bad configuration.')
-
-    def pos_data(self, timestamp, data, logconf):
-        position = [
-            data['stateEstimate.x'],
-            data['stateEstimate.y'],
-            data['stateEstimate.z']
-        ]
-        self.canvas.set_position(position)
-
-    def meas_data(self, timestamp, data, logconf):
-        measurement = {
-            'roll': data['stabilizer.roll'],
-            'pitch': data['stabilizer.pitch'],
-            'yaw': data['stabilizer.yaw'],
-            'front': data['range.front'],
-            'back': data['range.back'],
-            'up': data['range.up'],
-            'down': data['range.zrange'],
-            'left': data['range.left'],
-            'right': data['range.right']
-        }
-        self.canvas.set_measurement(measurement)
-
-
+########################################################################
+# 2D 맵 시각화를 위한 Canvas (PyQt + Vispy)
+########################################################################
 class Canvas(scene.SceneCanvas):
-    def __init__(self, keyupdateCB):
-        # Initialize the canvas without key shortcuts.
-        scene.SceneCanvas.__init__(self, keys=None)
-        self.size = 800, 600
+    def __init__(self):
+        scene.SceneCanvas.__init__(self, keys=None, size=(800, 600))
         self.unfreeze()
-
         self.view = self.central_widget.add_view()
         self.view.bgcolor = '#ffffff'
-        # Use a 2D camera for a 2D map view.
-        self.view.camera = scene.PanZoomCamera()
-        self.view.camera.center = (0.0,0.0)
-        
-        # Set the initial drone position to the center (0, 0)
-        self.last_pos = [0, 0]
+        # 카메라 설정 (2D PanZoom)
+        self.view.camera = PanZoomCamera(rect=(-5, -5, 10, 10))
+        self.view.camera.set_range()
+
+        # 마지막 위치 (2D: x,y)
+        self.last_pos = [0.0, 0.0]
+
+        # 드론 경로 및 센서측정 포인트를 저장할 배열
+        self.pos_history = np.empty((0, 2))
+        self.meas_history = np.empty((0, 2))
+
+        # 시각화를 위한 마커와 센서선을 생성
         self.pos_markers = visuals.Markers()
         self.meas_markers = visuals.Markers()
-        self.pos_data = np.array([0, 0], ndmin=2)
-        self.meas_data = np.array([0, 0], ndmin=2)
         self.lines = []
-
-        # Add marker visuals to the view.
-        self.view.add(self.pos_markers)
-        self.view.add(self.meas_markers)
-        # Create four sensor lines for left, right, front, and back.
-        for i in range(4):
-            line = visuals.Line()
+        for _ in range(4):  # left, right, front, back
+            line = visuals.Line(color='black')
             self.lines.append(line)
             self.view.add(line)
+        self.view.add(self.pos_markers)
+        self.view.add(self.meas_markers)
 
-        self.keyCB = keyupdateCB
-        """
-        # --- Add XY Axis lines ---
-        # X-axis: red line from -10 to 10 on the x-axis at y = 0.
-        x_axis = visuals.Line(color='red', width=2)
-        x_axis.set_data(np.array([[-10, 0], [10, 0]]))
-        self.view.add(x_axis)
-        # Y-axis: green line from -10 to 10 on the y-axis at x = 0.
-        y_axis = visuals.Line(color='green', width=2)
-        y_axis.set_data(np.array([[0, -10], [0, 10]]))
-        self.view.add(y_axis)
-        # --- End of XY Axis lines ---
-        """
-        # Optionally, add the initial drone marker at the center.
-        self.set_position(self.last_pos)
-        
+        # 100ms마다 화면 갱신하는 타이머
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.update_canvas)
+        self.timer.start(100)
+
         self.freeze()
 
-    def set_position(self, pos):
-        # In 2D, use only the x and y coordinates.
-        pos2d = [pos[0], pos[1]]
-        self.last_pos = pos2d
-        if PLOT_CF:
-            self.pos_data = np.append(self.pos_data, [pos2d], axis=0)
-            self.pos_markers.set_data(self.pos_data, face_color='red', size=5)
+    def update_canvas(self):
+        # 전역 변수 global_data에서 최신 position과 measurement를 가져옴
+        pos = global_data.get('position')
+        meas = global_data.get('measurement')
+        if pos is not None:
+            # 2D 위치 (x, y) 업데이트
+            self.last_pos = [pos[0], pos[1]]
+            self.pos_history = np.append(self.pos_history, [[pos[0], pos[1]]], axis=0)
+            self.pos_markers.set_data(self.pos_history, face_color='red', size=5)
+        if meas is not None:
+            points = self.rotate_and_create_points(meas)
+            # 센서 측정 선을 현재 위치에서 각 센서측정점으로 연결
+            for i in range(4):
+                if i < len(points):
+                    self.lines[i].set_data(np.array([self.last_pos, points[i]]))
+                else:
+                    self.lines[i].set_data(np.array([self.last_pos, self.last_pos]))
+            if points:
+                self.meas_history = np.append(self.meas_history, np.array(points), axis=0)
+                self.meas_markers.set_data(self.meas_history, face_color='blue', size=5)
+        self.update()
 
     def rot2d(self, yaw, origin, point):
-        """
-        Perform a 2D rotation of a point around a given origin using the yaw angle.
-        """
+        """yaw 각도(도)를 사용하여 origin을 기준으로 point를 회전"""
         rad = math.radians(yaw)
         cos_ = math.cos(rad)
         sin_ = math.sin(rad)
@@ -218,131 +110,148 @@ class Canvas(scene.SceneCanvas):
         return [x_new, y_new]
 
     def rotate_and_create_points(self, m):
-        """
-        Convert sensor measurements into rotated 2D points using only the horizontal directions.
-        """
+        """left, right, front, back 센서 데이터를 2D 좌표로 변환"""
         data = []
         o = self.last_pos
         yaw = m['yaw']
 
-        # Only use left, right, front, and back sensors.
         if m['left'] < SENSOR_TH:
             left = [o[0], o[1] + m['left'] / 1000.0]
             data.append(self.rot2d(yaw, o, left))
-
         if m['right'] < SENSOR_TH:
             right = [o[0], o[1] - m['right'] / 1000.0]
             data.append(self.rot2d(yaw, o, right))
-
         if m['front'] < SENSOR_TH:
             front = [o[0] + m['front'] / 1000.0, o[1]]
             data.append(self.rot2d(yaw, o, front))
-
         if m['back'] < SENSOR_TH:
             back = [o[0] - m['back'] / 1000.0, o[1]]
             data.append(self.rot2d(yaw, o, back))
-
         return data
 
-    def set_measurement(self, measurements):
-        data = self.rotate_and_create_points(measurements)
-        o = self.last_pos
-        for i in range(4):
-            if i < len(data):
-                # Update each sensor line from the current position to the computed sensor point.
-                self.lines[i].set_data(np.array([o, data[i]]))
-            else:
-                # If a sensor reading is missing, draw a degenerate line.
-                self.lines[i].set_data(np.array([o, o]))
-
-        if len(data) > 0:
-            self.meas_data = np.append(self.meas_data, data, axis=0)
-        self.meas_markers.set_data(self.meas_data, face_color='blue', size=5)
-
     def stop_and_save(self):
-        """ Stop mapping and save the full map view. """
+        """맵을 이미지 파일(map.png)로 저장하고 캔버스를 닫음"""
         img = self.render()
         imageio.imsave('map.png', img)
         print("Map saved to 'map.png'. Stopping mapping.")
         self.close()
 
+########################################################################
+# 로그 콜백 함수 (로그 설정에서 호출)
+########################################################################
+def update_position_callback(timestamp, data, logconf):
+    # position 데이터 (stateEstimate.x, y, z) 업데이트
+    global_data['position'] = [data['stateEstimate.x'], data['stateEstimate.y'], data['stateEstimate.z']]
 
+def update_measurement_callback(timestamp, data, logconf):
+    # 센서 데이터(roll, pitch, yaw, multiranger의 front, back, up, left, right, zrange)를 업데이트
+    global_data['measurement'] = {
+        'roll': data['stabilizer.roll'],
+        'pitch': data['stabilizer.pitch'],
+        'yaw': data['stabilizer.yaw'],
+        'front': data['range.front'],
+        'back': data['range.back'],
+        'up': data['range.up'],
+        'left': data['range.left'],
+        'right': data['range.right'],
+        'down': data.get('range.zrange', 999)  # 값이 없으면 999로 처리
+    }
 
-
-def Show_window():
-    app = QtWidgets.QApplication(sys.argv)
-    window = MainWindow(URI)
-    window.show()
-    app.exec()
-
-def wall_following():
+########################################################################
+# 벽 추종(wall following) 동작을 수행하는 함수 (Movement 제어 포함)
+########################################################################
+def wall_following_loop(scf):
     wall_follower = MW_WallFollower()
-
     lg_stab = LogConfig(name='Stabilizer', period_in_ms=100)
     lg_stab.add_variable('stabilizer.yaw', 'float')
 
-    cf = Crazyflie(rw_cache='./cache')
-    first_run = True
-    with SyncCrazyflie(URI, cf=cf) as scf:
-        scf.cf.platform.send_arming_request(True)
-        time.sleep(1.0)
+    # 드론 모터 활성화
+    scf.cf.platform.send_arming_request(True)
+    time.sleep(1.0)
 
+    try:
         with MotionCommander(scf) as motion_commander:
             with Multiranger(scf) as multiranger:
                 with SyncLogger(scf, lg_stab) as logger:
-                    print("Simplified Manhattan-world wall following started")
-                    try:
-                        while True:
-                            #Check LiDAR measurment get successfully
-                            if first_run:
-                                if multiranger.left is None:
-                                    continue
-                                else:
-                                    first_run = False
-
-                            # 센서 데이터 (미터 단위)
-                            if multiranger.front is None:
-                                front_range = 999
-                            else:
-                                front_range = multiranger.front  # 전방 센서
-
+                    print("Wall following started")
+                    first_run = True
+                    while True:
+                        # 초기 실행 시 left 센서 값이 없으면 대기
+                        if first_run:
                             if multiranger.left is None:
-                                left_range = 999
+                                continue
                             else:
-                                left_range = multiranger.left   # 좌측 센서
+                                first_run = False
 
-                            t = time.time()
-                            # 상태 업데이트: 전진 명령 또는 회전 명령 결정
-                            v_x, v_y, yaw_rate = wall_follower.update(front_range, left_range, t)
-                        
-                            # MotionCommander는 yaw_rate를 deg/s 단위로 받으므로 변환
-                            # (부호는 라이브러리 이슈에 따라 조정)
-                            yaw_rate_deg = math.degrees(yaw_rate)
-                            
-                            motion_commander.start_linear_motion(v_x, v_y, 0, rate_yaw=yaw_rate_deg)
-                        
-                            # 디버깅 출력
-                            print(f"State: {wall_follower.state:7s} | front: {front_range:.2f} | left: {left_range:.2f} | v_x: {v_x:.2f} | v_y: {v_y:.2f} | yaw_rate: {yaw_rate_deg:.2f}")
-                        
-                            # 상단 센서(up)가 0.2m 미만이면 종료 (예: 착륙)
-                            if is_close(multiranger.up):
-                                print("Top sensor triggered. Stopping wall following.")
-                                motion_commander.land(0.2)
-                                break
-                            
-                            time.sleep(0.1)
-                    except KeyboardInterrupt:
-                        print("KeyboardInterrupt received. Exiting loop.")
-            scf.cf.platform.send_arming_request(False)
+                        # 센서 측정 (단위: 미터)
+                        front_range = multiranger.front if multiranger.front is not None else 999
+                        left_range = multiranger.left if multiranger.left is not None else 999
+
+                        t = time.time()
+                        v_x, v_y, yaw_rate = wall_follower.update(front_range, left_range, t)
+                        yaw_rate_deg = math.degrees(yaw_rate)
+                        motion_commander.start_linear_motion(v_x, v_y, 0, rate_yaw=yaw_rate_deg)
+
+                        print(f"State: {wall_follower.state:7s} | front: {front_range:.2f} | left: {left_range:.2f} | "
+                              f"v_x: {v_x:.2f} | v_y: {v_y:.2f} | yaw_rate: {yaw_rate_deg:.2f}")
+
+                        # 위쪽 센서(up)가 일정 거리 이하이면 착륙 후 종료
+                        if is_close(multiranger.up):
+                            print("Top sensor triggered. Landing.")
+                            motion_commander.land(0.2)
+                            break
+
+                        time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("KeyboardInterrupt received. Exiting wall following loop.")
+    finally:
+        scf.cf.platform.send_arming_request(False)
+
+########################################################################
+# 메인 함수: 연결, 로그 설정, wall following, 그리고 시각화 실행
+########################################################################
+def main():
+    cflib.crtp.init_drivers()
+    cf = Crazyflie(rw_cache='./cache')
+    with SyncCrazyflie(URI, cf=cf) as scf:
+        # [2] 로그 설정: position
+        lpos = LogConfig(name='Position', period_in_ms=100)
+        lpos.add_variable('stateEstimate.x')
+        lpos.add_variable('stateEstimate.y')
+        lpos.add_variable('stateEstimate.z')
+        scf.cf.log.add_config(lpos)
+        lpos.data_received_cb.add_callback(update_position_callback)
+        lpos.start()
+
+        # [2] 로그 설정: 측정값 (multiranger 및 stabilizer)
+        lmeas = LogConfig(name='Meas', period_in_ms=100)
+        lmeas.add_variable('range.front')
+        lmeas.add_variable('range.back')
+        lmeas.add_variable('range.up')
+        lmeas.add_variable('range.left')
+        lmeas.add_variable('range.right')
+        lmeas.add_variable('range.zrange')
+        lmeas.add_variable('stabilizer.roll')
+        lmeas.add_variable('stabilizer.pitch')
+        lmeas.add_variable('stabilizer.yaw')
+        scf.cf.log.add_config(lmeas)
+        lmeas.data_received_cb.add_callback(update_measurement_callback)
+        lmeas.start()
+
+        # [3] 벽 추종 동작을 별도 쓰레드에서 실행
+        wall_thread = threading.Thread(target=wall_following_loop, args=(scf,))
+        wall_thread.start()
+        time.sleep(3)
+
+        # [4] Qt/Vispy를 이용해 2D 맵 실시간 시각화 (이 부분에서는 드론 제어 코드는 없음)
+        app = QtWidgets.QApplication(sys.argv)
+        canvas = Canvas()
+        canvas.show()
+        app.exec()
+
+        # Qt 창 종료 후 벽 추종 쓰레드 종료 대기 및 맵 저장
+        wall_thread.join()
+        canvas.stop_and_save()
 
 if __name__ == '__main__':
-    cflib.crtp.init_drivers()
-
-    #window_process = Process(target=Show_window)
-    follow_process = Process(target=wall_following)
-
-    #window_process.start()
-    follow_process.start()
-
-    follow_process.join()
-    #window_process.join()
+    main()
